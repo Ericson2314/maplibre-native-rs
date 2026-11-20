@@ -1,6 +1,9 @@
 //! File for defining how we download and link against `MapLibre Native`.
 //! Set `MLN_CORE_LIBRARY_PATH` and `MLN_CORE_LIBRARY_HEADERS_PATH` environment variables to use a local version of maplibre
 //!
+//! Set `MLN_SYSTEM` to use an installed `mbgl-core` instead, found with pkg-config, with its headers and the libraries it
+//! links, as MapLibre Native's install rules provide it.
+//!
 //! If you don't use the AMALGAM library define the env variable `MLN_CORE_LIBRARY_NO_AMALGAM` (value does not matter).
 //! In this case all dependent libraries get linked manually
 //!
@@ -422,6 +425,17 @@ fn bundle_precompiled() -> Info {
     Info { lib_name, include_dirs, cpp_root }
 }
 
+/// An installed `mbgl-core`, found with pkg-config, with its headers and the libraries it links.
+fn probe_system_core() -> pkg_config::Library {
+    pkg_config::Config::new()
+        .cargo_metadata(false)
+        .env_metadata(true)
+        .probe("mbgl-core")
+        .unwrap_or_else(|e| {
+            panic!("MLN_SYSTEM is set, but `mbgl-core` was not found with pkg-config: {e}")
+        })
+}
+
 fn clone_repository<P: AsRef<Path>>(
     clone_dir: P,
     folder_name: &str,
@@ -668,6 +682,7 @@ fn build_mln() {
     let amalgam_lib =
         precompiled || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0");
     let system_lib = !env::var("MLN_SYSTEM").unwrap_or("0".to_string()).eq("0");
+    let system_core = system_lib.then(probe_system_core);
     let local_repository = env::var("MLN_LOCAL_REPOSITORY").unwrap_or_default();
 
     if !local_repository.is_empty() {
@@ -707,10 +722,12 @@ fn build_mln() {
 
     let info = if precompiled {
         bundle_precompiled()
-    } else if system_lib {
-        // Using pkg config
-        // let mut cfg = pkg_config::Config::new();
-        panic!("Not implemented")
+    } else if let Some(core) = &system_core {
+        Info {
+            lib_name: "mbgl-core".to_string(),
+            include_dirs: core.include_paths.clone(),
+            cpp_root: PathBuf::new(),
+        }
     } else {
         const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
         let respository_dir = if local_repository.is_empty() {
@@ -747,10 +764,19 @@ fn build_mln() {
         &info.lib_name,
         &info.include_dirs,
         backend,
-        precompiled || source_core_uses_ndebug,
+        precompiled || system_lib || source_core_uses_ndebug,
     );
     let is_apple = target_os == "macos" || target_os == "ios";
-    if !amalgam_lib {
+    if let Some(core) = &system_core {
+        // After the bridge and `mbgl-core`, which `build_bridge` links: the
+        // libraries the installed core links, as its pkg-config file gives them.
+        for dir in &core.link_paths {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        for lib in core.libs.iter().filter(|lib| *lib != "mbgl-core") {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    } else if !amalgam_lib {
         // The dependent libs are not bundled in the core lib, so we have to link manually
         // Required for mlt-cpp. Cpp root link search was already added above
         println!(
