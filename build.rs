@@ -324,7 +324,7 @@ fn resolve_mln_core() -> (PathBuf, Vec<PathBuf>) {
 
 /// Gather include directories and build the C++ bridge using `cxx_build`.
 ///
-/// The bridge is linked by `build_mln` beforehand, so `cc` must not link it again: rustc keeps only the last
+/// The bridge is linked by `probe_core` beforehand, so `cc` must not link it again: rustc keeps only the last
 /// mention of a library, which would be after `mbgl-core` and the libraries it links.
 fn build_bridge(include_dirs: &[PathBuf], backend: GraphicsApi, core_uses_ndebug: bool) {
     // println!("cargo:warning=Include_dirs: {:?}", include_dirs);
@@ -445,6 +445,21 @@ fn system_core() -> Info {
     }
     // An installed core is assumed to be a release build, as its pkg-config file does not say.
     Info { libs: core.libs, include_dirs: core.include_paths, ndebug: true }
+}
+
+/// Get `mbgl-core` from `build_internal`, link it, and return its include directories, and whether it was built with
+/// `NDEBUG`.
+///
+/// The C++ bridge, which `build_bridge` builds afterwards, is linked first, as it uses the core.
+fn probe_core(build_internal: impl FnOnce() -> Info + 'static) -> (Vec<PathBuf>, bool) {
+    println!("cargo:rustc-link-search=native={}", env::var("OUT_DIR").unwrap());
+    println!("cargo:rustc-link-lib=static={BRIDGE_LIB}");
+
+    let info = build_internal();
+    for lib in &info.libs {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+    (info.include_dirs, info.ndebug)
 }
 
 fn clone_repository<P: AsRef<Path>>(
@@ -776,44 +791,42 @@ fn build_mln() {
         }
     }
 
-    let info = if precompiled {
-        bundle_precompiled()
-    } else if system_lib {
-        system_core()
-    } else {
-        const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
-        let respository_dir = if local_repository.is_empty() {
-            let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-            root.join("target")
+    let target_os_internal = target_os.clone();
+    let (include_dirs, core_uses_ndebug) = probe_core(move || {
+        let target_os = target_os_internal;
+        if precompiled {
+            bundle_precompiled()
+        } else if system_lib {
+            system_core()
         } else {
-            assert!(
-                local_repository.ends_with(MAPLIBRE_NATIVE_DIR_NAME),
-                "The repository must be called: {MAPLIBRE_NATIVE_DIR_NAME}"
-            );
-            PathBuf::from(local_repository.clone()).parent().unwrap().to_path_buf()
-        };
+            const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
+            let respository_dir = if local_repository.is_empty() {
+                let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+                root.join("target")
+            } else {
+                assert!(
+                    local_repository.ends_with(MAPLIBRE_NATIVE_DIR_NAME),
+                    "The repository must be called: {MAPLIBRE_NATIVE_DIR_NAME}"
+                );
+                PathBuf::from(local_repository.clone()).parent().unwrap().to_path_buf()
+            };
 
-        match build_local(&respository_dir, MAPLIBRE_NATIVE_DIR_NAME, amalgam_lib, &target_os) {
-            Err(e) => {
-                if respository_dir.join(MAPLIBRE_NATIVE_DIR_NAME).exists()
-                    && local_repository.is_empty()
-                {
-                    // let _ = fs::remove_dir_all(clone_dir.join(MAPLIBRE_NATIVE_DIR_NAME));
+            match build_local(&respository_dir, MAPLIBRE_NATIVE_DIR_NAME, amalgam_lib, &target_os) {
+                Err(e) => {
+                    if respository_dir.join(MAPLIBRE_NATIVE_DIR_NAME).exists()
+                        && local_repository.is_empty()
+                    {
+                        // let _ = fs::remove_dir_all(clone_dir.join(MAPLIBRE_NATIVE_DIR_NAME));
+                    }
+                    panic!("Failed to build maplibre native: {e}")
                 }
-                panic!("Failed to build maplibre native: {e}")
+                Ok(info) => info,
             }
-            Ok(info) => info,
         }
-    };
+    });
 
     let backend = GraphicsApi::from_selected_features();
-    println!("cargo:rustc-link-search=native={}", env::var("OUT_DIR").unwrap());
-    println!("cargo:rustc-link-lib=static={BRIDGE_LIB}");
-    build_bridge(&info.include_dirs, backend, info.ndebug);
-    // Link mbgl-core after the bridge - or else `cargo test` won't be able to find the symbols.
-    for lib in &info.libs {
-        println!("cargo:rustc-link-lib={lib}");
-    }
+    build_bridge(&include_dirs, backend, core_uses_ndebug);
     let is_apple = target_os == "macos" || target_os == "ios";
     if !is_apple {
         println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
