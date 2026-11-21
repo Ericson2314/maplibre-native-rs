@@ -32,6 +32,7 @@ const MLN_COMMIT: &str = "core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b";
 
 const BRIDGE_RS: &str = "src/bridge.rs";
 const BRIDGE_CPP_DIR: &str = "src/cpp";
+const BRIDGE_LIB: &str = "maplibre_rust_map_renderer_bindings";
 
 const BRIDGE_INCLUDE_DIRS: &[&str] = &["src/cpp"];
 
@@ -322,6 +323,9 @@ fn resolve_mln_core() -> (PathBuf, Vec<PathBuf>) {
 }
 
 /// Gather include directories and build the C++ bridge using `cxx_build`.
+///
+/// The bridge is linked by `build_mln` beforehand, so `cc` must not link it again: rustc keeps only the last
+/// mention of a library, which would be after `mbgl-core` and the libraries it links.
 fn build_bridge(include_dirs: &[PathBuf], backend: GraphicsApi, core_uses_ndebug: bool) {
     // println!("cargo:warning=Include_dirs: {:?}", include_dirs);
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -329,6 +333,7 @@ fn build_bridge(include_dirs: &[PathBuf], backend: GraphicsApi, core_uses_ndebug
         BRIDGE_INCLUDE_DIRS.iter().map(|p| root.join(p)).collect();
     let mut build = cxx_build::bridge(BRIDGE_RS);
     build
+        .cargo_metadata(false)
         .includes(&bridge_include_dirs)
         .includes(include_dirs)
         .flag_if_supported("-std=c++20")
@@ -386,7 +391,14 @@ fn build_bridge(include_dirs: &[PathBuf], backend: GraphicsApi, core_uses_ndebug
         build.file("src/cpp/texture.cpp");
     }
 
-    build.compile("maplibre_rust_map_renderer_bindings");
+    build.compile(BRIDGE_LIB);
+
+    // The C++ standard library, as `cc` would link it.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let libcxx = matches!(target_os.as_str(), "macos" | "ios" | "freebsd" | "openbsd");
+        println!("cargo:rustc-link-lib={}", if libcxx { "c++" } else { "stdc++" });
+    }
 }
 
 struct Info {
@@ -795,6 +807,8 @@ fn build_mln() {
     };
 
     let backend = GraphicsApi::from_selected_features();
+    println!("cargo:rustc-link-search=native={}", env::var("OUT_DIR").unwrap());
+    println!("cargo:rustc-link-lib=static={BRIDGE_LIB}");
     build_bridge(&info.include_dirs, backend, info.ndebug);
     // Link mbgl-core after the bridge - or else `cargo test` won't be able to find the symbols.
     for lib in &info.libs {
