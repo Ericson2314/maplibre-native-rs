@@ -1,8 +1,9 @@
 //! File for defining how we download and link against `MapLibre Native`.
 //! Set `MLN_CORE_LIBRARY_PATH` and `MLN_CORE_LIBRARY_HEADERS_PATH` environment variables to use a local version of maplibre
 //!
-//! Set `MLN_SYSTEM` to use an installed `mbgl-core` instead, found with pkg-config, with its headers and the libraries it
-//! links, as MapLibre Native's install rules provide it.
+//! An installed `mbgl-core` is used instead if `system-deps` finds one with pkg-config, with its headers and the libraries
+//! it links, as MapLibre Native's install rules provide it. Set `SYSTEM_DEPS_MBGL_CORE_BUILD_INTERNAL` to `never` to
+//! require one, or to `always` to never use one.
 //!
 //! If you don't use the AMALGAM library define the env variable `MLN_CORE_LIBRARY_NO_AMALGAM` (value does not matter).
 //! In this case all dependent libraries get linked manually
@@ -431,35 +432,59 @@ fn bundle_precompiled() -> Info {
     Info { libs: vec![lib_name], include_dirs, ndebug: true }
 }
 
-/// An installed `mbgl-core`, found with pkg-config, with its headers and the libraries it links.
-fn system_core() -> Info {
-    let core = pkg_config::Config::new()
-        .cargo_metadata(false)
-        .env_metadata(true)
-        .probe("mbgl-core")
-        .unwrap_or_else(|e| {
-            panic!("MLN_SYSTEM is set, but `mbgl-core` was not found with pkg-config: {e}")
-        });
-    for dir in &core.link_paths {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-    }
-    // An installed core is assumed to be a release build, as its pkg-config file does not say.
-    Info { libs: core.libs, include_dirs: core.include_paths, ndebug: true }
-}
-
-/// Get `mbgl-core` from `build_internal`, link it, and return its include directories, and whether it was built with
-/// `NDEBUG`.
+/// Find `mbgl-core` with `system-deps`, as `Cargo.toml` declares it, downloading or building one with `build_internal`
+/// if no installed one is found, and return its include directories, and whether it was built with `NDEBUG`.
 ///
-/// The C++ bridge, which `build_bridge` builds afterwards, is linked first, as it uses the core.
+/// `system-deps` links the core when probing, so the C++ bridge, which `build_bridge` builds afterwards, is linked
+/// first.
 fn probe_core(build_internal: impl FnOnce() -> Info + 'static) -> (Vec<PathBuf>, bool) {
+    // TODO: probe with `cargo_metadata(false)` and print it after building the bridge instead, letting `cc` link the
+    // bridge and the C++ standard library again, once a `system-deps` with
+    // https://github.com/gdesmott/system-deps/pull/164 is released.
     println!("cargo:rustc-link-search=native={}", env::var("OUT_DIR").unwrap());
     println!("cargo:rustc-link-lib=static={BRIDGE_LIB}");
 
-    let info = build_internal();
-    for lib in &info.libs {
-        println!("cargo:rustc-link-lib={lib}");
+    // Fall back to downloading or building the core, as before `system-deps` was used. TODO: say so in `Cargo.toml`
+    // instead, once a `system-deps` with https://github.com/gdesmott/system-deps/pull/162 is released.
+    if env::var_os("SYSTEM_DEPS_MBGL_CORE_BUILD_INTERNAL").is_none()
+        && env::var_os("SYSTEM_DEPS_BUILD_INTERNAL").is_none()
+    {
+        env::set_var("SYSTEM_DEPS_MBGL_CORE_BUILD_INTERNAL", "auto");
     }
-    (info.include_dirs, info.ndebug)
+
+    let deps = system_deps::Config::new()
+        .add_build_internal("mbgl-core", move |name, version| {
+            Ok(internal_library(name, version, &build_internal()))
+        })
+        .probe()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let core = deps.get_by_name("mbgl-core").unwrap();
+    // An installed core is assumed to be a release build, as its pkg-config file does not say.
+    let ndebug =
+        core.source == system_deps::Source::PkgConfig || core.defines.contains_key("NDEBUG");
+    (core.include_paths.clone(), ndebug)
+}
+
+/// A downloaded or built core, for `system-deps` to link.
+fn internal_library(name: &str, version: &str, info: &Info) -> system_deps::Library {
+    system_deps::Library {
+        name: name.to_string(),
+        source: system_deps::Source::EnvVariables,
+        libs: info
+            .libs
+            .iter()
+            .map(|name| system_deps::InternalLib { name: name.clone(), is_static_available: true })
+            .collect(),
+        link_paths: Vec::new(),
+        link_files: Vec::new(),
+        frameworks: Vec::new(),
+        framework_paths: Vec::new(),
+        include_paths: info.include_dirs.clone(),
+        ld_args: Vec::new(),
+        defines: info.ndebug.then(|| ("NDEBUG".to_string(), None)).into_iter().collect(),
+        version: version.to_string(),
+        statik: true,
+    }
 }
 
 fn clone_repository<P: AsRef<Path>>(
@@ -745,7 +770,6 @@ fn source_core_libs(target_os: &str, backend: GraphicsApi) -> Vec<&'static str> 
 
 #[allow(clippy::too_many_lines)]
 fn build_mln() {
-    println!("cargo:rerun-if-env-changed=MLN_SYSTEM");
     println!("cargo:rerun-if-env-changed=MLN_PRECOMPILE");
     println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_USE_AMALGAM");
     println!("cargo:rerun-if-env-changed=MLN_LOCAL_REPOSITORY");
@@ -753,7 +777,6 @@ fn build_mln() {
     let precompiled = !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
     let amalgam_lib =
         precompiled || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0");
-    let system_lib = !env::var("MLN_SYSTEM").unwrap_or("0".to_string()).eq("0");
     let local_repository = env::var("MLN_LOCAL_REPOSITORY").unwrap_or_default();
 
     if !local_repository.is_empty() {
@@ -796,8 +819,6 @@ fn build_mln() {
         let target_os = target_os_internal;
         if precompiled {
             bundle_precompiled()
-        } else if system_lib {
-            system_core()
         } else {
             const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
             let respository_dir = if local_repository.is_empty() {
